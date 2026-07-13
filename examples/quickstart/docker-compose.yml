@@ -1,0 +1,43 @@
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.33-latest
+    command: ["envoy", "-c", "/etc/envoy/proxy-config.yaml", "--log-level", "info"]
+    volumes:
+      - ./proxy-config.yaml:/etc/envoy/proxy-config.yaml:ro
+    ports:
+      - "10000:10000" # LLM traffic entrypoint
+      - "9901:9901"   # Envoy admin
+    depends_on:
+      - guardrails-llm-filter-extproc
+      - mock-llm
+
+  guardrails-llm-filter-extproc:
+    build:
+      context: ../..
+    environment:
+      GUARDRAILS_LOG_LEVEL: debug
+      GUARDRAILS_LOG_FORMAT: text
+      # Default in_memory store needs no dependencies. Try redis:
+      #   GUARDRAILS_STORE_BACKEND: redis
+      #   GUARDRAILS_STORE_REDIS_ADDR: redis:6379
+      GUARDRAILS_STORE_BACKEND: in_memory
+      GUARDRAILS_HEADERS_EXPOSE_TRIGGERED_RULES: "true"
+      # Per-request masking audit trail (GET :9080/v1/audit/records):
+      GUARDRAILS_AUDIT_ENABLED: "true"
+      # Uncomment to also store the masked request texts in audit records:
+      #   GUARDRAILS_AUDIT_STORE_MASKED_TEXTS: "true"
+      # The configuration API (:9080) is unauthenticated. This demo exposes it
+      # on a trusted local network; in production protect it at the network
+      # layer (cluster-internal only, never public ingress).
+    ports:
+      - "9080:9080" # management REST API (grpc-gateway)
+      - "9090:9090" # management gRPC API (GuardrailsApi)
+      - "9091:9091" # Prometheus metrics
+
+  # Uncomment for the redis store backend:
+  # redis:
+  #   image: redis:7-alpine
+
+  mock-llm:
+    build:
+      context: ./mock-llm

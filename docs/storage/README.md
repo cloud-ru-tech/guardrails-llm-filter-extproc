@@ -1,0 +1,190 @@
+# Хранилище
+
+Один выбираемый через env бэкенд (`GUARDRAILS_STORE_BACKEND`) обслуживает **четыре
+роли** за `internal/repository.Store`:
+
+```go
+MaskingStateStore  // Put/Get/DeleteMaskingState(ctx, requestID, state)
+RuleStore          // ListRules / GetRule / SaveRule (upsert) / DeleteRule
+SettingsStore      // GetSettings (nil,nil = никогда не задавали) / SaveSettings
+AuditStore         // Put/GetAuditRecord / ListAuditRecords (фильтр + курсор)
+Store              // все четыре + Ping + Close
+```
+
+`repository.ErrNotFound` — общий sentinel «не найдено». Подпакет `factory`
+(`internal/repository/factory`) строит бэкенд — он в подпакете, потому что пакет
+интерфейсов должен оставаться импортируемым реализациями (иначе цикл импортов). Внешние
+бэкенды `Ping`'уются на старте, чтобы неправильная конфигурация ломала старт pod'а, а не
+data-path.
+
+## Контракт жизненного цикла masking state
+
+- **Ключ**: значение `x-request-id` запроса (UUID от Envoy); fallback
+  `uuid.NewString()` при отсутствии (корректно внутри потока, не обнаруживается между
+  репликами — это нормально, обнаруживать нечего).
+  - **ИНВАРИАНТ БЕЗОПАСНОСТИ**: `x-request-id` должен генерироваться (или
+    регенерироваться) шлюзом на границе доверия, никогда не браться у
+    неаутентифицированного клиента. При общем внешнем хранилище и раздельной топологии
+    запрос/ответ фаза ответа откатывается к `GetMaskingState(x-request-id)`; клиент,
+    способный подделать живой request id жертвы (плюс литеральный текст плейсхолдера в
+    своём теле), мог бы демаскировать оригиналы жертвы в свой ответ. Envoy генерирует
+    id по умолчанию — не настраивайте его на сохранение клиентского значения.
+- **Put**: конец фазы тела запроса, только если замены непусты.
+- **Get**: фаза заголовков ответа, только если in-process-состояние пусто (фазу запроса
+  обработала другая реплика — ретраи Envoy или раздельные топологии).
+- **Delete**: best-effort при закрытии потока с отдельным контекстом на 2 с.
+- **TTL** (`GUARDRAILS_STORE_MASKING_TTL`, по умолчанию 15m) — страховка от пропущенных
+  удалений; должен превышать самый длинный ожидаемый стриминговый ответ.
+- **Все ошибки data-path только логируются + метрика
+  (`masking_state_store_failures_total{op}`)** — сбой хранилища не должен блокировать
+  трафик. Худший случай: плейсхолдеры остаются недемаскированными, когда состояние
+  записала другая реплика.
+
+### Безопасность
+
+`MaskingState.Replacements` содержит **исходные чувствительные значения**. С
+`redis`/`postgres` они покидают память процесса. Меры: короткий TTL, delete-on-close,
+хранилище с ограниченным доступом, отсутствие логирования и **опциональное шифрование на
+месте**.
+
+#### Шифрование на месте (`GUARDRAILS_STORE_ENCRYPTION_*`)
+
+`GUARDRAILS_STORE_ENCRYPTION_ENABLED=true` + `GUARDRAILS_STORE_ENCRYPTION_KEY=<base64
+32-байтный ключ>` (сгенерируйте `openssl rand -base64 32`) шифруют сериализованный
+masking state алгоритмом **AES-256-GCM** перед отправкой во внешний бэкенд
+(`internal/repository/statecodec`, подключается фабрикой к `redis` и `postgres`; no-op
+для `in_memory` — данные не покидают процесс). Отсутствующий или битый ключ ломает
+старт; ключ не логируется.
+
+Сохранённое значение становится JSON-конвертом — всё ещё валидный JSONB, поэтому схема
+postgres не меняется:
+
+```json
+{"_enc":"aes256gcm","v":1,"data":"<base64(nonce||ciphertext)>"}
+```
+
+Семантика:
+
+- **Постепенное включение**: с включённым шифрованием старые plaintext-записи всё ещё
+  читаемы (конверт распознаётся по ключу `_enc`); все записи шифруются в пределах одного
+  masking-TTL (≤15m по умолчанию).
+- **Выключение при наличии зашифрованных записей**: чтения падают с
+  `repository.ErrUndecryptable` — всплывает как `op="decrypt"` в
+  `masking_state_store_failures_total` и warning-лог, трафик остаётся fail-open (ответ
+  проходит недемаскированным).
+- **Ротация ключа** — это рестарт с новым ключом: старые записи становятся
+  недешифруемыми (fail-open промахи демаскирования для запросов в полёте) и истекают в
+  пределах masking-TTL. Мультиключевой поддержки нет.
+
+## Контракт аудит-записи (`AuditStore`)
+
+Пишется `internal/service/audit.Recorder` (асинхронно, с ограничением одновременных
+записей, fail-open) при `GUARDRAILS_AUDIT_ENABLED=true` и наличии замен в запросе;
+читается эндпоинтами `/v1/audit`.
+
+- **Upsert по request_id** — ретрай Envoy с тем же x-request-id перезаписывает запись
+  (последняя запись побеждает).
+- **Порядок**: `(Timestamp desc, RequestID desc)`; **курсор** =
+  `base64url("<unixNano>:<requestID>")` (`internal/repository/cursor.go`, `ErrBadCursor`
+  на мусоре). Размер страницы по умолчанию 50, максимум 500 (`AuditQuery.ClampAuditLimit`).
+- **Таймстемпы усечены до микросекунд каждым бэкендом** — postgres TIMESTAMPTZ и score
+  ZSET в redis (float64 — UnixNano потерял бы точность) не держат наносекунды, а
+  математике курсора нужно, чтобы JSON-документ и индекс совпадали.
+- **Retention**: `GUARDRAILS_AUDIT_RETENTION` (по умолчанию 24h). В отличие от masking
+  state, delete-on-close нет — единственная чистка это истечение.
+- Записи несут ID правил, типы данных и плейсхолдеры — **никаких оригиналов по
+  построению** (у `models.AuditReplacement` нет поля Original). `MaskedTexts` (opt-in) —
+  всё ещё пользовательский контент промпта, усечённый рекордером до 64 KiB на текст.
+
+Раскладка по бэкендам:
+
+- **memory**: `map[string]auditEntry` под общим RWMutex; janitor вытесняет истёкшие
+  аудит-записи; `GUARDRAILS_AUDIT_MAX_ENTRIES` ограничивает карту (вытеснение старейшего
+  при вставке). List = снимок + фильтр + сортировка.
+- **redis**: `guardrails:audit:rec:<request_id>` — STRING JSON с `EX = retention`, плюс
+  ZSET-индекс `guardrails:audit:idx` (score = UnixMicro, member = request_id). Каждый Put
+  сам подрезает записи индекса старше окна retention — janitor'а нет. List идёт по
+  `ZREVRANGEBYSCORE` пачками и применяет фильтры на клиенте с ограниченным бюджетом скана
+  (10 пачек), поэтому сильно отфильтрованный запрос может вернуть короткую страницу с
+  `next_cursor`.
+- **postgres**: таблица `guardrails_audit` — денормализованные колонки
+  `ts/model/path/rule_ids/data_types` питают SQL-фильтрацию и keyset-пагинацию
+  (`(ts, request_id) < (cursor)` + `LIMIT n+1`), JSONB-документ `record` — источник
+  истины; GIN-индекс по `rule_ids`; janitor masking state также удаляет истёкшие строки
+  аудита.
+
+## Бэкенды
+
+### memory (`internal/repository/memory`) — по умолчанию
+
+Карты + `sync.RWMutex`, janitor-горутина (тикер 1m), вытесняющая истёкшие masking-записи,
+плюс ленивая проверка истечения на Get. `Close()` идемпотентен и ждёт janitor. Кастомные
+правила/настройки **не переживают рестарт** — env-дефолты + YAML-файлы это durable-база
+(задокументированное поведение). Полностью корректен для одной реплики: запрос и ответ
+делят один процесс.
+
+### redis (`internal/repository/redis`)
+
+Собственный клиент `go-redis/v9` (`Config{Addr, Password, DB}`). Раскладка:
+
+```
+guardrails:mask:<request_id>   STRING  payload statecodec*  EX = masking TTL
+guardrails:rules               HASH    field=rule_id → JSON(rule.Rule)   без TTL
+guardrails:rules:disabled      SET     member=rule_id                    без TTL
+guardrails:settings            STRING  JSON(GuardrailsSettings)          без TTL
+```
+
+\* обычный `JSON(MaskingState)` либо конверт AES-256-GCM при включённом шифровании (см.
+«Безопасность» выше).
+
+`DeleteRule` проверяет счётчик ответа HDEL для `ErrNotFound`.
+
+### postgres (`internal/repository/postgres`)
+
+`jackc/pgx/v5` + `pgxpool`. Схема — **встроенный идемпотентный bootstrap** (`schema.sql`,
+`CREATE TABLE IF NOT EXISTS`, применяется в `New`) — осознанное решение не тащить
+церемонии golang-migrate ради трёх таблиц; комментарий в schema.sql советует перейти на
+инструмент миграций, если схема начнёт эволюционировать.
+
+```sql
+guardrails_rules          (rule_id TEXT PK, rule JSONB, created_at, updated_at)
+guardrails_disabled_rules (rule_id TEXT PK, updated_at)  -- правила, отключённые через PATCH /v1/rules/{id}
+guardrails_settings       (id SMALLINT PK CHECK(id=1), settings JSONB, updated_at)  -- singleton-строка
+guardrails_masking_state  (request_id TEXT PK, state JSONB, expires_at TIMESTAMPTZ) + индекс expires
+```
+
+`state` держит payload statecodec — обычный JSON `MaskingState` или конверт AES-256-GCM;
+оба валидный JSONB, поэтому включение шифрования не требует изменения схемы.
+
+JSONB-документы (а не колонки) держат схему отвязанной от эволюции Go-структур.
+`expires_at` вычисляется в Go (`time.Now().Add(ttl)` — избегает нюансов
+interval-кодирования pgx); Get фильтрует `expires_at > now()`; janitor-горутина удаляет
+истёкшие строки каждую минуту (таймаут exec 30s). Upsert'ы через `ON CONFLICT ... DO UPDATE`.
+
+## Требования к JSON round-trip
+
+`models.MaskingState`/`Replacement` и `rule.Rule`/`MaskingConfig` несут JSON-теги,
+задающие **стабильный wire-формат** хранилищ. Заметьте: `rule.Rule.Group`/`DataType` —
+`yaml:"-"` (наследуются от родительской группы в файлах), но **сериализуются** в JSON —
+сохранённое правило обязано round-trip'ить отдельно. Набор repositorytest проверяет
+полноту всех полей; расширяйте его при добавлении полей.
+
+## Набор conformance-тестов (`internal/repository/repositorytest`)
+
+`repositorytest.Run(t, newStore, Options{ExpireMaskingState})` покрывает: round-trip
+masking / not-found / overwrite / delete-idempotent / истечение TTL (через инъектируемый
+хук expire — `FastForward` miniredis для redis), CRUD правил + upsert + список
+независимо от порядка, набор disabled-ID (round trip, идемпотентность, независимость от
+записей правил), round-trip настроек nil-then-set, Ping.
+
+- memory: запускается напрямую (+ собственные тесты крошечного TTL и остановки горутин).
+- redis: **miniredis** — без Docker, дружелюбно к CI. Прогоняет набор дважды (обычный и
+  зашифрованный codec) плюс тесты, специфичные для шифрования (ciphertext на месте,
+  чтение legacy plaintext, зашифрованная запись при выключенном шифровании).
+- postgres: **testcontainers-go** `postgres:16-alpine`, пропускается под `-short` и без
+  Docker; подтесты делят один контейнер и TRUNCATE между прогонами (~60s). Также
+  прогоняет обычный + зашифрованный под-наборы и проверку сырого `state::text` (нет
+  plaintext-оригиналов на месте).
+
+Любой новый бэкенд обязан проходить этот набор; изменения поведения сначала попадают в
+набор.
